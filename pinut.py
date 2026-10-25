@@ -11,7 +11,7 @@ the UPS again and starts over; if the UPS is already on battery at that point
 (the Pi restarted mid-outage), it shuts the servers down straight away.
 
     python3 pinut.py                  run (systemd does this)
-    python3 pinut.py --shutdown NAME  shut one server down now, to test its setup
+    python3 pinut.py --shutdown SERVER_NAME  shut one server down now, to test its setup
 """
 
 import logging
@@ -307,7 +307,7 @@ class Guard:
         if self.first_reading:
             return "already on battery when PiNUT started (it restarted mid-outage?)"
         if low_s >= LOW_CONFIRM_S:
-            return f"low battery for {fmt(low_s)} (charge {charge}%)"
+            return f"low battery for {fmt(low_s)} (charge {'?' if charge is None else f'{charge:g}'}%)"
         if on_battery_s < BLIP_S:
             return None
         if on_battery_s >= MAX_ON_BATTERY_S:
@@ -329,8 +329,9 @@ class Guard:
             if name not in self.asked:  # the first time, all of them, whatever ping says
                 self.ask(server)
             elif alive[name] is not False and now - self.asked[name] >= RESEND_S:
-                log.warning("%s still answering ping %s after the last request: asking again",
-                            name, fmt(now - self.asked[name]))
+                log.warning("%s %s %s after the last request: asking again", name,
+                            "still answering ping" if alive[name] else "not proven off (ping failed)",
+                            fmt(now - self.asked[name]))
                 self.ask(server)
 
             if alive[name] is False:
@@ -369,7 +370,7 @@ class Guard:
                 log.info("%s: shutdown request accepted %s", name, err)
             else:
                 # Also what a shutdown that cuts its own connection looks like.
-                log.warning("%s: ssh ended with exit %s: %s", name, p.returncode, err[-300:])
+                log.warning("%s: ssh ended with exit %s%s", name, p.returncode, f": {err[-300:]}" if err else "")
             del self.ssh[name]
 
     def cut_when_proven_off(self, ups, alive):
@@ -491,7 +492,7 @@ def settings_errors():
 
 
 def shutdown_one(name):
-    """--shutdown NAME: one real request, waited for, so you can see the result."""
+    """--shutdown SERVER_NAME: one real request, waited for, so you can see the result."""
     server = next((s for s in SERVERS if s["name"] == name), None)
     if server is None:
         print(f"no server {name!r} in SERVERS: {', '.join(s['name'] for s in SERVERS)}")

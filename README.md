@@ -1,4 +1,4 @@
-# PiNUT
+# PiNUT (minimal)
 
 Shut your servers down cleanly when the power goes out.
 
@@ -145,7 +145,7 @@ sudo systemctl disable --now nut-monitor
 - `DRIVER_SERVICE`: the name the last check printed, usually
   `nut-driver@custom-ups-name.service`.
 - `SERVERS`: one line per server: a name, its IP, the user PiNUT logs in
-  as, and its key (`~/.ssh/pinut_<name>`, made in step 4).
+  as, and its key (`~/.ssh/pinut_SERVER_NAME`, made in step 4).
 - Leave `DRY_RUN = True` for now: it logs every decision and acts on none.
 - `SAFE_LOAD_PCT` gets measured in step 6. The other defaults are a good start.
 
@@ -155,41 +155,122 @@ Each server gets its own key. **The server decides what the key can do:**
 it is installed with a fixed shutdown command, so whatever the Pi sends,
 that command runs, and a stolen key can only shut that one server down.
 
+Do steps a to d once per server. In the commands, replace these with your
+own values:
+
+| Placeholder | What it is | Example |
+|---|---|---|
+| `SERVER_NAME` | The server's `name` in `SERVERS` (step 3). Short, no spaces | `omv` |
+| `SERVER_IP` | The server's IP address | `192.168.1.40` |
+| `ADMIN_USER` | Your usual admin account on the server, the one you log in with | `admin` |
+| `PUBLIC_KEY` | The line `cat` prints in step a | `ssh-ed25519 AAAAC3Nz...Qz pinut-omv` |
+
 **a. Make the key**, on the Pi:
 
 ```bash
-ssh-keygen -t ed25519 -N "" -C pinut-NAME -f ~/.ssh/pinut_NAME
-cat ~/.ssh/pinut_NAME.pub     # you paste this on the server
-hostname -I                   # this Pi's IP, for from= below
+ssh-keygen -t ed25519 -N "" -C pinut-SERVER_NAME -f ~/.ssh/pinut_SERVER_NAME
+cat ~/.ssh/pinut_SERVER_NAME.pub     # prints the PUBLIC_KEY you paste into the commands in step c
 ```
 
-**b. Trust the server's host key.** On the server's own console, list its
-fingerprints: `for k in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$k"; done`
-(on Windows: `Get-ChildItem C:\ProgramData\ssh\ssh_host_*_key.pub | % { ssh-keygen -lf $_.FullName }`).
-Then on the Pi, log in once with an ordinary admin account, and answer `yes`
-only if the fingerprint matches:
+For a server named `omv`, that is `ssh-keygen ... -C pinut-omv -f ~/.ssh/pinut_omv`
+and `cat ~/.ssh/pinut_omv.pub`. It makes two files:
+
+- `~/.ssh/pinut_omv`: the **private** key. It never leaves the Pi. This is
+  the `key` in `SERVERS`.
+- `~/.ssh/pinut_omv.pub`: the **public** key, one line of text like
+  `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGx...Qz pinut-omv`.
+
+You don't copy any file to the server (no `scp`). You copy that one line from
+the Pi's terminal and paste it into step c's command, in place of
+`PUBLIC_KEY`. The command writes it into the right file on the server.
+
+**b. Trust the server's host key.** This makes sure the Pi talks to your
+real server and not something pretending to be it. On the server's own
+console (or an SSH session you already trust), list its fingerprints:
+
+```bash
+for k in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$k"; done
+```
+
+On Windows: `Get-ChildItem C:\ProgramData\ssh\ssh_host_*_key.pub | % { ssh-keygen -lf $_.FullName }`.
+
+It prints several lines, one per key type (ED25519, ECDSA, RSA). That is
+normal. Each looks like `256 SHA256:abc123... root@omv (ED25519)`. There is
+nothing to copy from them; you only compare them by eye.
+
+Then, on the Pi, log in once with your admin account:
 
 ```bash
 ssh -o StrictHostKeyChecking=ask ADMIN_USER@SERVER_IP
 ```
 
+- **It asks "Are you sure you want to continue connecting?"**: answer `yes`
+  only if the fingerprint it shows matches one of the server's lines. Then
+  log in with your password and `exit`.
+- **It goes straight to the password prompt, no question**: the Pi already
+  trusts this server (you connected to it before). Log in and `exit`, then
+  check that what the Pi trusts is the real key:
+
+  ```bash
+  ssh-keygen -l -F SERVER_IP
+  ```
+
+  Find the line with the same type (ED25519, say) in both lists. The
+  `SHA256:...` text must be identical. If it differs, or the command prints
+  nothing, stop and find out why before going on.
+
 PiNUT refuses any server whose host key is unknown or has changed.
 
-**c. Install the key on the server**, for its kind. In each line, replace
-`PI_IP` and `PUBLIC_KEY` (the whole `ssh-ed25519 ... pinut-NAME` line).
+**c. Install the key on the server**, for its kind. In each command,
+replace `PUBLIC_KEY` with the whole line from step a, from `ssh-ed25519` to
+`pinut-SERVER_NAME`, inside the single quotes and on one line.
 
 <details><summary><b>Ubuntu, Debian, OpenMediaVault</b></summary>
 
-Create a user with no password and no admin rights. Ubuntu:
-`sudo adduser --disabled-password --gecos "" shutdownbot`. OMV: create
-`shutdownbot` in the Web UI, add it to the `_ssh` group only, then
-`sudo passwd --lock shutdownbot`. (On OMV, never put the key in the Web UI's
-*Public Keys* field: keys there get a full shell.)
+**Create the user `shutdownbot`**, the account PiNUT logs in as. It gets no
+usable password and no admin rights.
+
+- **Ubuntu, Debian:**
+
+  ```bash
+  sudo adduser --disabled-password --gecos "" shutdownbot
+  ```
+
+- **OpenMediaVault:** OMV insists on a password, so give it one and then lock
+  it. A locked password turns off password login, but key login still works.
+  Either way works:
+
+  - In the Web UI: *Users → Create* `shutdownbot` with any long random
+    password (you won't need it again), and add it to the `_ssh` group only,
+    not `sudo`. Then in the OMV terminal: `sudo passwd --lock shutdownbot`.
+  - Or all in the OMV terminal:
+
+    ```bash
+    sudo useradd -m -s /bin/bash -G _ssh shutdownbot
+    sudo passwd --lock shutdownbot
+    ```
+
+  OMV's SSH server only lets in root and members of `_ssh`, which is why the
+  group matters. Never put the key in the Web UI's *Public Keys* field: keys
+  there get a full shell.
+
+**Check the user**, before going on:
+
+```bash
+getent passwd shutdownbot   # the last field must be a real shell: /bin/bash or /usr/bin/sh
+id shutdownbot              # on OMV, must list _ssh
+```
+
+If the last field is `/usr/sbin/nologin` or `/bin/false`, the fixed command
+cannot run and the shutdown fails: `sudo usermod -s /bin/bash shutdownbot`.
+
+**Install the key and allow the shutdown.** Paste your `PUBLIC_KEY` into
+the `echo` line first:
 
 ```bash
 H=$(getent passwd shutdownbot | cut -d: -f6)
 sudo install -d -m 700 -o shutdownbot -g "$(id -gn shutdownbot)" "$H/.ssh"
-echo 'from="PI_IP",restrict,command="/usr/bin/sudo -n /usr/bin/systemctl --no-block -i poweroff" PUBLIC_KEY' |
+echo 'restrict,command="/usr/bin/sudo -n /usr/bin/systemctl --no-block -i poweroff" PUBLIC_KEY' |
     sudo tee -a "$H/.ssh/authorized_keys" >/dev/null
 sudo chown shutdownbot: "$H/.ssh/authorized_keys"
 sudo chmod 600 "$H/.ssh/authorized_keys"
@@ -200,6 +281,21 @@ echo 'shutdownbot ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block -i poweroff
 sudo chmod 440 /etc/sudoers.d/shutdownbot-poweroff
 sudo visudo -cf /etc/sudoers.d/shutdownbot-poweroff
 ```
+
+With the key pasted in, the `echo` line looks like this:
+
+```bash
+echo 'restrict,command="/usr/bin/sudo -n /usr/bin/systemctl --no-block -i poweroff" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGx...Qz pinut-omv' |
+```
+
+Check that the key landed as **one** line (a terminal can wrap a long line
+when you copy it, and then the key does not work):
+
+```bash
+sudo cat "$H/.ssh/authorized_keys"
+```
+
+If `visudo` says "command not found", install sudo first: `sudo apt install sudo`.
 
 `-i` powers off even when an app or update asks to wait: a clean shutdown
 now beats a hard power cut later.
@@ -213,7 +309,8 @@ stops the array first.
 
 ```bash
 ls -ld /root/.ssh      # should point to /boot/config/ssh/root, so the key survives reboots
-echo 'from="PI_IP",restrict,command="/usr/local/sbin/powerdown" PUBLIC_KEY' >> /root/.ssh/authorized_keys
+echo 'restrict,command="/usr/local/sbin/powerdown" PUBLIC_KEY' >> /root/.ssh/authorized_keys
+cat /root/.ssh/authorized_keys     # the key must be on one line
 ```
 
 `powerdown` keeps the SSH session open while the array stops, so the log
@@ -258,11 +355,35 @@ Windows blocks ping by default; PiNUT needs it, so allow *File and Printer
 Sharing (Echo Request - ICMPv4-In)* in the firewall.
 </details>
 
-**d. Test it for real**, at a time it is fine to turn the server off:
+<details><summary><b>Optional: accept the key only from this Pi (<code>from=</code>)</b></summary>
+
+On Linux and Unraid you can start the key line with `from="PI_IP",`, so the
+server refuses the key from any other address:
+
+```text
+from="192.168.1.20",restrict,command="..." ssh-ed25519 AAAA... pinut-omv
+```
+
+`hostname -I` on the Pi shows its IP. **Only do this if the Pi's address
+never changes**: give it a fixed address in your router (a "DHCP
+reservation"), or allow your whole network with `from="192.168.1.0/24"`.
+Otherwise, the day the Pi gets a new address the servers refuse the key, and
+in the next outage nothing shuts down. Don't use the Pi's hostname here: it
+usually never matches.
+</details>
+
+**d. Test it for real**, at a time it is fine to turn the server off. First
+add the server to `SERVERS` in `~/pinut/pinut.py`, for example:
+
+```python
+{"name": "omv", "host": "192.168.1.40", "user": "shutdownbot", "key": "~/.ssh/pinut_omv"},
+```
+
+Then, on the Pi:
 
 ```bash
-python3 ~/pinut/pinut.py --shutdown NAME
-ping SERVER_IP          # until it stops answering
+python3 ~/pinut/pinut.py --shutdown SERVER_NAME
+ping SERVER_IP          # until it stops answering; Ctrl-C to stop
 ```
 
 Turn it back on and test once more, to prove the setup survives a reboot.
@@ -345,7 +466,7 @@ rm -r ~/pinut ~/.ssh/pinut_*
 sudo systemctl enable --now nut-monitor   # only if you had it on before
 ```
 
-On each server, delete the key's line (it ends in `pinut-NAME`); on Linux
+On each server, delete the key's line (it ends in `pinut-SERVER_NAME`); on Linux
 also `/etc/sudoers.d/shutdownbot-poweroff` and the user; on Windows the
 `Match User shutdownbot` block, then `Restart-Service sshd` and
 `Remove-LocalUser shutdownbot`.

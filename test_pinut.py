@@ -10,12 +10,16 @@ plus 20% per server still on, so it drops below SAFE_LOAD_PCT (5%) only
 when all of them are off.
 """
 
+import logging
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import pinut
+
+# pinut's log lines would bury the results; the tests check what it does, not what it says.
+logging.getLogger("pinut").disabled = True
 
 
 class FakeSsh:
