@@ -1,0 +1,22 @@
+# Installed by README step 5, which fills in __USER__ and __HOME__, as
+# /etc/systemd/system/pinut.service.
+[Unit]
+Description=PiNUT: shut servers down cleanly when the UPS is on battery
+After=network-online.target nut-server.service
+Wants=network-online.target nut-server.service
+# Wants, not Requires: with Requires, stopping nut-server would stop PiNUT for
+# good. Instead it keeps running and handles that as lost contact.
+
+[Service]
+Type=simple
+User=__USER__
+Environment=HOME=__HOME__
+WorkingDirectory=__HOME__/pinut
+ExecStart=/usr/bin/python3 __HOME__/pinut/pinut.py
+Restart=always
+RestartSec=5
+# pinut.py exits with 2 when its settings are wrong: restarting would not help.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target
