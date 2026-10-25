@@ -1,4 +1,4 @@
-# PiNUT (minimal)
+# PiNUT
 
 Shut your servers down cleanly when the power goes out.
 
