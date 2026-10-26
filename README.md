@@ -49,6 +49,7 @@ except when it last rebooted the Pi.
 | `pinut.py` | The program. Settings at the top |
 | `test_pinut.py` | Plays fake outages through the logic. No hardware needed |
 | `pinut.service` | Starts it at boot |
+| `.gitignore` | Keeps the NUT password and the reboot count out of git |
 
 ## What you need
 
@@ -60,19 +61,24 @@ except when it last rebooted the Pi.
 
 ## Setup
 
-### 1. Copy it to the Pi
+### 1. Download it to the Pi
 
 As your normal user:
 
 ```bash
-sudo apt install nut
-install -d -m 700 ~/pinut
-install -m 755 pinut.py test_pinut.py ~/pinut/
-python3 -c 'import secrets; print(secrets.token_hex(16))' > ~/pinut/upscmd.password
-chmod 600 ~/pinut/upscmd.password
+sudo apt install nut git
+git clone https://github.com/YOUR-USERNAME/pinut.git ~/pinut
+cd ~/pinut
+python3 -c 'import secrets; print(secrets.token_hex(16))' > upscmd.password
+chmod 600 upscmd.password
 ```
 
-From here on, edit `~/pinut/pinut.py`, not the copy you downloaded.
+PiNUT runs straight from this folder, and it must be `~/pinut`: the service
+and the settings look for it there. Ending the `git clone` line with
+`~/pinut` puts it there whatever folder you run it from.
+
+The password is for NUT, in step 2. `.gitignore` keeps it, and the reboot
+count PiNUT writes later, out of git.
 
 ### 2. Set up NUT
 
@@ -96,6 +102,39 @@ NUT has three parts: a **driver** that talks to the UPS over USB, a
 
 The name in square brackets is your choice (letters, numbers, `-`, `_`).
 Every command below uses it.
+
+**IMPORTANT!**
+
+**Copy only these five lines** from what `nut-scanner` printed: `driver`,
+`port`, `vendorid`, `productid` and `serial`. Leave out everything else:
+
+- `bus`, `device` and `busport` describe where the UPS sits on the USB bus
+  *right now*. `device` changes when the UPS is replugged, and `bus` and
+  `busport` when it goes into another USB port. A copied one can then stop
+  matching, and the driver no longer finds the UPS. Without them, the
+  driver finds the UPS by its IDs and serial, wherever it is plugged in.
+- `product` and `vendor` are not needed, and `product` contains the
+  firmware version (`FW:...`), so it would stop matching after a firmware
+  update. The `###NOTMATCHED-YET###` line is a note from `nut-scanner`,
+  not a setting.
+
+<details><summary><b>The driver says <code>libusb1: Could not open any HID devices: insufficient permissions on everything</code></b></summary>
+
+The `nut` user, which the driver runs as, is not allowed to open the UPS's
+USB device. That permission comes from a rule NUT installs, and the rule
+only applies when the device is plugged in. So if the UPS was already
+connected when you installed NUT, the rule never ran for it.
+
+Unplug the UPS's USB cable and plug it back in (or reboot the Pi), then
+restart NUT with the commands below. To check the permission:
+
+```bash
+lsusb                          # e.g. "Bus 003 Device 002: ID 051d:0002 American Power Conversion..."
+ls -l /dev/bus/usb/003/002     # use your Bus and Device numbers; the group must be nut
+```
+
+You see this message where the driver logs: `journalctl -u 'nut-driver@*'`.
+</details>
 
 **In `/etc/nut/nut.conf`:** `MODE=standalone`.
 
@@ -403,6 +442,7 @@ sudo visudo -cf /etc/sudoers.d/pinut
 And install the service, without starting it yet:
 
 ```bash
+cd ~/pinut
 sed -e "s|__USER__|$USER|" -e "s|__HOME__|$HOME|g" pinut.service |
     sudo tee /etc/systemd/system/pinut.service >/dev/null
 sudo systemctl daemon-reload
@@ -455,6 +495,18 @@ plus 2 minutes does not fit well inside your UPS's runtime after
   `sudo systemctl stop pinut`, work, `sudo systemctl start pinut`.
 - **After changing a setting:** `sudo systemctl restart pinut`. Settings
   errors show in the log, and it does not start until they are fixed.
+- **Updating.** Your settings are edits to `pinut.py`, so set them aside
+  while git updates the file, then put them back:
+
+  ```bash
+  cd ~/pinut
+  git stash && git pull && git stash pop
+  python3 test_pinut.py && sudo systemctl restart pinut
+  ```
+
+  If `git stash pop` reports a conflict, the update changed the settings
+  too. Open `pinut.py`, keep your values, delete the `<<<<<<<`, `=======`
+  and `>>>>>>>` lines, then run `git stash drop`.
 
 ## Uninstall
 
