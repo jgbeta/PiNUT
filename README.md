@@ -165,7 +165,7 @@ sudo systemctl restart nut-server
 upsc custom-ups-name ups.status      # OL = on mains, OB = on battery
 upsc custom-ups-name ups.load
 upscmd -l custom-ups-name            # must list load.off.delay
-upscmd -u upsctl -p "$(cat ~/pinut/upscmd.password)" -w custom-ups-name shutdown.stop   # must print OK
+upscmd -u upsctl -p "$(cat ~/pinut/upscmd.password)" -w custom-ups-name shutdown.stop   # must print SUCCESS
 systemctl list-units 'nut-driver*'   # the driver's service name, for DRIVER_SERVICE
 ```
 
