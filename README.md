@@ -7,7 +7,7 @@ UPS Tools). When the power has been out long enough, or the battery runs low,
 it shuts each server down over SSH and proves they are really off. Then it
 turns the UPS output off, so the battery is not drained for nothing.
 
-This is the small version: one program (`pinut.py`, settings at the top),
+This is the small version: one program (`pinut.py`), a short settings file,
 its tests, and a systemd unit. No installer; the steps below are the install.
 
 ## How it works
@@ -16,11 +16,15 @@ Every 5 seconds the Pi reads the UPS. On mains, that is all it does.
 
 1. **On battery: wait.** Outages shorter than `BLIP_S` (60 s) are ignored.
 2. **Decide.** It shuts the servers down after `MAX_ON_BATTERY_S` (10 min)
-   on battery, or sooner once the charge is down to `SHUTDOWN_CHARGE_PCT`
-   (50%). Low battery (the UPS's own LB signal, or `LOW_CHARGE_PCT`) skips
-   the 60 s wait, once it has held for 15 s.
+   on battery, or sooner: once the charge is down to `SHUTDOWN_CHARGE_PCT`
+   (50%), or once the UPS's runtime estimate has been below `MIN_RUNTIME_S`
+   (10 min) for 15 s. Low battery (the UPS's own LB signal, or
+   `LOW_CHARGE_PCT`) skips the 60 s wait, once it has held for 15 s.
 3. **Shut down.** It asks every server at once, over SSH. A server still
    answering ping 5 minutes later is asked again, as often as it takes.
+   Servers marked `early` go first, `EARLY_SHUTDOWN_S` (5 min) into the
+   outage: shutting down a power-hungry machine you can spare makes the
+   battery last longer for the rest.
 4. **Prove they are off.** No server answers ping **and** the UPS load is
    at or below `SAFE_LOAD_PCT`, without a break, for `PROOF_S` (90 s). It
    checks again every 5 s, so a server that comes back starts the proof over.
@@ -46,15 +50,17 @@ except when it last rebooted the Pi.
 
 | File | |
 |---|---|
-| `pinut.py` | The program. Settings at the top |
+| `pinut.py` | The program. Every setting and its default is at the top |
+| `config.example.toml` | The settings you change, to copy to `config.toml` (step 3) |
 | `test_pinut.py` | Plays fake outages through the logic. No hardware needed |
 | `pinut.service` | Starts it at boot |
-| `.gitignore` | Keeps the NUT password and the reboot count out of git |
+| `.gitignore` | Keeps your `config.toml`, the NUT password, the reboot count and calibration files out of git |
 
 ## What you need
 
-- A Raspberry Pi with Raspberry Pi OS (or another Debian), powered from the
-  UPS, on the same network as the servers.
+- A Raspberry Pi with Raspberry Pi OS 12 (Bookworm) or newer, or another
+  Debian with Python 3.11 or newer, powered from the UPS, on the same
+  network as the servers. `python3 --version` shows yours.
 - A UPS that [NUT supports](https://networkupstools.org/stable-hcl.html),
   connected by USB, that accepts `load.off.delay` (step 2 checks).
 - Admin access to each server, once.
@@ -77,8 +83,8 @@ PiNUT runs straight from this folder, and it must be `~/pinut`: the service
 and the settings look for it there. Ending the `git clone` line with
 `~/pinut` puts it there whatever folder you run it from.
 
-The password is for NUT, in step 2. `.gitignore` keeps it, and the reboot
-count PiNUT writes later, out of git.
+The password is for NUT, in step 2. `.gitignore` keeps it, your settings and the files PiNUT writes
+later out of git.
 
 ### 2. Set up NUT
 
@@ -166,7 +172,7 @@ upsc custom-ups-name ups.status      # OL = on mains, OB = on battery
 upsc custom-ups-name ups.load
 upscmd -l custom-ups-name            # must list load.off.delay
 upscmd -u upsctl -p "$(cat ~/pinut/upscmd.password)" -w custom-ups-name shutdown.stop   # must print SUCCESS
-systemctl list-units 'nut-driver*'   # the driver's service name, for DRIVER_SERVICE
+systemctl list-units 'nut-driver*'   # must list nut-driver@custom-ups-name.service
 ```
 
 **Turn off NUT's own shutdown program.** It would shut the Pi down on low
@@ -178,15 +184,47 @@ sudo systemctl disable --now nut-monitor
 
 ### 3. Settings
 
-`nano ~/pinut/pinut.py`. At the top:
+Your settings go in `~/pinut/config.toml`. Start from the example:
 
-- `UPS`: your UPS name, as `custom-ups-name@localhost`.
-- `DRIVER_SERVICE`: the name the last check printed, usually
-  `nut-driver@custom-ups-name.service`.
-- `SERVERS`: one line per server: a name, its IP, the user PiNUT logs in
-  as, and its key (`~/.ssh/pinut_SERVER_NAME`, made in step 4).
-- Leave `DRY_RUN = True` for now: it logs every decision and acts on none.
-- `SAFE_LOAD_PCT` gets measured in step 6. The other defaults are a good start.
+```bash
+cd ~/pinut
+cp config.example.toml config.toml
+nano config.toml
+```
+
+- `UPS_NAME`: the name in square brackets from step 2. PiNUT works out the
+  rest from it: `custom-ups-name@localhost` to read the UPS, and
+  `nut-driver@custom-ups-name.service` to restart the driver.
+- `SERVERS`: one `[[SERVERS]]` block per server, at the end of the file: a
+  name, its IP, the user PiNUT logs in as, and its key (`~/.ssh/pinut_SERVER_NAME`, made in step 4). You fill
+  these in as you set each server up in step 4.
+- Leave `DRY_RUN = true` for now: it logs every decision and acts on none.
+- `SAFE_LOAD_PCT` gets measured in step 6.
+- `MAX_ON_BATTERY_S` and `MIN_RUNTIME_S` depend on how long this UPS lasts
+  with your servers on it. The defaults are a good start. If this UPS's
+  runtime estimate (`upsc custom-ups-name battery.runtime`, in seconds) is
+  far from what it really lasts, turn that trigger off with
+  `MIN_RUNTIME_S = 0`.
+
+The file's rules (it is [TOML](https://toml.io)):
+
+- Text goes in `"quotes"`; `true`, `false` (lowercase) and numbers do not.
+- `#` starts a comment.
+- Every line below a `[[SERVERS]]` belongs to that server. Put settings above
+  the first one; PiNUT stops with an error if it finds one below.
+
+Every setting at the top of `pinut.py` can go in `config.toml`, with the same
+name, and the value in `config.toml` wins. A name that is not a setting is
+reported in the log and not used; a value of the wrong kind (text where a
+number belongs, say) stops PiNUT with an error saying which. git ignores
+`config.toml`, so an update never touches your settings.
+
+<details><summary><b>Keeping the settings in <code>pinut.py</code> instead</b></summary>
+
+With no `config.toml`, PiNUT uses the settings at the top of `pinut.py` as
+they are. Run by hand, it asks first; as a service, it logs a warning and
+carries on. An update can then conflict with your edits (see *Updating*).
+</details>
 
 ### 4. Set up each server
 
@@ -412,11 +450,18 @@ usually never matches.
 </details>
 
 **d. Test it for real**, at a time it is fine to turn the server off. First
-add the server to `SERVERS` in `~/pinut/pinut.py`, for example:
+add a block for it at the end of `~/pinut/config.toml`, for example:
 
-```python
-{"name": "omv", "host": "192.168.1.40", "user": "shutdownbot", "key": "~/.ssh/pinut_omv"},
+```toml
+[[SERVERS]]
+name = "omv"
+host = "192.168.1.40"
+user = "shutdownbot"
+key = "~/.ssh/pinut_omv"
 ```
+
+Add `early = true` to a power-hungry machine you can spare, like a
+workstation, to shut it down first in an outage.
 
 Then, on the Pi:
 
@@ -425,12 +470,20 @@ python3 ~/pinut/pinut.py --shutdown SERVER_NAME
 ping SERVER_IP          # until it stops answering; Ctrl-C to stop
 ```
 
+The last line it prints is one of these:
+
+- `OK`: the server accepted the request.
+- `FAILED`: the request never reached the server, and the error above it says
+  why. For example, a timeout means nothing answered on port 22.
+- `UNSURE`: the connection dropped. A shutdown that cuts its own connection
+  ends like this too, so watch the ping.
+
 Turn it back on and test once more, to prove the setup survives a reboot.
 
 ### 5. Let PiNUT reboot the Pi and restart the driver
 
-Exactly those two commands, nothing else. Use the `DRIVER_SERVICE` name from
-step 3:
+Exactly those two commands, nothing else. Put your UPS name from step 2 in
+the driver's service name:
 
 ```bash
 echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl restart nut-driver@custom-ups-name.service" |
@@ -448,19 +501,46 @@ sed -e "s|__USER__|$USER|" -e "s|__HOME__|$HOME|g" pinut.service |
 sudo systemctl daemon-reload
 ```
 
-### 6. Measure SAFE_LOAD_PCT
+### 6. Calibrate: time the shutdowns and measure SAFE_LOAD_PCT
 
-With **every server off** (after step 4's tests, for example), read the
-load a few times:
+On mains power, at a time it is fine for **every** server to go off:
 
 ```bash
-upsc custom-ups-name ups.load
+python3 ~/pinut/pinut.py --calibrate
 ```
 
-Set `SAFE_LOAD_PCT` to the highest reading plus 2. Too low, and PiNUT can
-never prove the servers off, so it never cuts the output; too high, and a
-server still on could pass for off. Each running server should add clearly
-more than 2 to the load.
+It warns you first and only goes ahead once you type `yes`. Then it asks
+every server to shut down at once, for real (`DRY_RUN` does not apply; the
+UPS output is never cut). For `CALIBRATE_S` (5 minutes) it records the UPS
+load every second and keeps pinging the servers. Let it run to the end.
+Then it prints something like:
+
+```text
+RESULTS after 5m 00s:
+  unraid  stopped answering ping after 2m 13s
+  omv     stopped answering ping after 0m 41s
+
+Average load, last 10 s: 3.0%
+Suggested SAFE_LOAD_PCT: 5 (the highest of those, plus 2). Yours is 5
+Load every second: /home/pi/pinut/calibration-20261027-141502.csv
+```
+
+- **Each time** is from the request to the server's last ping reply. The
+  slowest one is how much battery your shutdown needs (step 8).
+- **Set `SAFE_LOAD_PCT`** in `config.toml` to the suggested value. Too low,
+  and PiNUT can never prove the servers off, so it never cuts the output;
+  too high, and a server still on could pass for off. Each running server
+  should add clearly more than 2 to the load.
+- **`STILL ANSWERING`**: that server took longer than the test, or never
+  shut down; the ssh result under it says which. Raise `CALIBRATE_S` in
+  `config.toml` and run it again.
+- **`never answered ping`**: a wrong `host`, or a firewall blocking ping.
+  PiNUT relies on ping to tell when a server is off, so fix this first.
+- **The CSV** has a `time,load` row for every second, to open in a
+  spreadsheet. The load may change in steps of a few seconds: that is how
+  often the UPS driver refreshes it.
+
+Then turn the servers back on.
 
 ### 7. Test, in dry run
 
@@ -470,22 +550,30 @@ sudo systemctl enable --now pinut
 journalctl -u pinut -f
 ```
 
-To watch an outage without waiting 10 minutes, set `MAX_ON_BATTERY_S = 90`,
-`sudo systemctl restart pinut`, and unplug the UPS from the wall. The log
-should go: `ON BATTERY`, `SHUTTING THE SERVERS DOWN`, `DRY RUN: would ask`,
-then `waiting`. It stops there: nothing was really shut down, so nothing can
-be proven off. Plug it back in (`MAINS BACK`) and set the value back.
+The log's first line says where the settings came from (`settings from
+.../config.toml`).
+
+To watch an outage without waiting 10 minutes, add `MAX_ON_BATTERY_S = 90`
+to `config.toml` (above the servers), `sudo systemctl restart pinut`, and unplug the UPS from the
+wall. The log should go: `ON BATTERY`, `SHUTTING THE SERVERS DOWN`,
+`DRY RUN: would ask`, then `waiting`. (`SHUTTING THE SERVERS DOWN` can come
+sooner, with the runtime as its reason, if the UPS's estimate is below
+`MIN_RUNTIME_S`.) It stops there: nothing was really shut down, so nothing
+can be proven off. Plug it back in (`MAINS BACK`) and set the value back.
 
 ### 8. Go live
 
-Set `DRY_RUN = False`, then `sudo systemctl restart pinut`.
+Set `DRY_RUN = false` in `config.toml`, then `sudo systemctl restart pinut`.
+
+Check that the shutdown fits in the battery: the slowest time from step 6,
+plus 2 minutes, must fit well inside what is left of your UPS's runtime
+when the shutdown starts. If it doesn't, lower `MAX_ON_BATTERY_S`, raise
+`MIN_RUNTIME_S` or `SHUTDOWN_CHARGE_PCT`, or mark a power-hungry server
+`early`.
 
 The first real outage is worth doing on purpose, at a quiet time: unplug the
 UPS, watch the log until the output is cut, then plug it back in and check
-the output comes back by itself. The log shows how long each server took
-("stopped answering ping ... after the shutdown began"): if the slowest one
-plus 2 minutes does not fit well inside your UPS's runtime after
-`MAX_ON_BATTERY_S`, lower `MAX_ON_BATTERY_S`.
+the output comes back by itself.
 
 ## Day to day
 
@@ -495,18 +583,19 @@ plus 2 minutes does not fit well inside your UPS's runtime after
   `sudo systemctl stop pinut`, work, `sudo systemctl start pinut`.
 - **After changing a setting:** `sudo systemctl restart pinut`. Settings
   errors show in the log, and it does not start until they are fixed.
-- **Updating.** Your settings are edits to `pinut.py`, so set them aside
-  while git updates the file, then put them back:
+  Warnings (a name that is not a setting, say) show too, but it starts.
+- **Updating.** Your settings are in `config.toml`, which git leaves alone:
 
   ```bash
   cd ~/pinut
-  git stash && git pull && git stash pop
+  git pull
   python3 test_pinut.py && sudo systemctl restart pinut
   ```
 
-  If `git stash pop` reports a conflict, the update changed the settings
-  too. Open `pinut.py`, keep your values, delete the `<<<<<<<`, `=======`
-  and `>>>>>>>` lines, then run `git stash drop`.
+  If you kept your settings in `pinut.py` instead, set your edits aside
+  while git updates the file: `git stash && git pull && git stash pop`. If
+  `git stash pop` reports a conflict, open `pinut.py`, keep your values,
+  delete the `<<<<<<<`, `=======` and `>>>>>>>` lines, then `git stash drop`.
 
 ## Uninstall
 
@@ -527,8 +616,9 @@ also `/etc/sudoers.d/shutdownbot-poweroff` and the user; on Windows the
 
 - **Start servers again.** They stay off after an outage until you start
   them.
-- **Shut down in an order** (storage last, say). Everything goes at once.
+- **Shut down in an order** (storage last, say). Everything goes at once,
+  apart from the `early` servers, which go first to save battery.
+- **Start an `early` server again** if the mains returns before the others
+  shut down. It stays off like the rest.
 - **Cancel the cut if the mains returns** during the UPS's few-second delay.
   The servers are off by then anyway.
-- **Use the UPS's runtime estimate.** Many report it badly; charge and time
-  on battery are used instead.

@@ -1,0 +1,37 @@
+# PiNUT settings for this Pi and its UPS (README, step 3):
+#
+#   cp ~/pinut/config.example.toml ~/pinut/config.toml    then edit config.toml
+#
+# These are the settings that differ from one UPS to the next. Any other
+# setting from the top of pinut.py can go here too, with the same name.
+# Text goes in "quotes"; true, false (lowercase) and numbers do not.
+
+# UPS settings
+UPS_NAME = "custom-ups-name"  # the [name] from /etc/nut/ups.conf (step 2)
+DRY_RUN = true                # only log what it would do. Keep true until a fake outage looks right (step 7)
+
+# Shutdown settings
+SAFE_LOAD_PCT = 5             # UPS load (%) with every server off: run --calibrate (step 6)
+CUT_COMMAND = "load.off.delay"  # turns the output off after the UPS's own delay
+
+# When to shut down: these depend on how long this UPS lasts with your servers on it
+MAX_ON_BATTERY_S = 600        # on battery this long: shut down
+MIN_RUNTIME_S = 600           # or once the UPS's runtime estimate is below this. 0: off
+EARLY_SHUTDOWN_S = 300        # when the "early = true" servers are asked
+
+# Servers: one [[SERVERS]] block each. Keep them at the end of the file:
+# every line below a [[SERVERS]] belongs to that server.
+# host is pinged, and logged in to as user with key. What the key may run
+# is set on the server, not here (step 4).
+[[SERVERS]]
+name = "unraid"
+host = "192.168.1.10"
+user = "root"
+key = "~/.ssh/pinut_unraid"
+
+[[SERVERS]]
+name = "workstation"
+host = "192.168.1.60"
+user = "shutdownbot"
+key = "~/.ssh/pinut_workstation"
+early = true                  # power-hungry: asked EARLY_SHUTDOWN_S into an outage, to save battery

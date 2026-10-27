@@ -1,0 +1,6 @@
+# Your settings, and what PiNUT and its setup write on the Pi: never committed
+config.toml
+upscmd.password
+reboots
+calibration-*.csv
+__pycache__/

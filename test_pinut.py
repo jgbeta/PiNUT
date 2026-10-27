@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Fake outages, played through pinut.py's logic on a fake clock. No UPS, no
-servers, no root, nothing is sent anywhere.
+Fake outages, played through pinut.py's logic on a fake clock, plus checks
+of the config file, --shutdown and --calibrate. No UPS, no servers, no
+root, nothing is sent anywhere.
 
     python3 test_pinut.py        (or: python3 -m unittest -v test_pinut)
 
@@ -10,6 +11,8 @@ plus 20% per server still on, so it drops below SAFE_LOAD_PCT (5%) only
 when all of them are off.
 """
 
+import contextlib
+import io
 import logging
 import tempfile
 import unittest
@@ -164,6 +167,59 @@ class Outage(unittest.TestCase):
         self.assertEqual(len(self.asked), 2)
         self.assertLess(self.t - start, pinut.BLIP_S)
 
+    def test_short_runtime_counts_after_the_blip_wait(self):
+        self.extra = {"battery.runtime": str(pinut.MIN_RUNTIME_S - 300)}
+        self.outage()
+        self.play(pinut.BLIP_S - 5)
+        self.assertEqual(self.asked, [])
+        self.play(10)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_short_runtime_must_hold(self):
+        self.outage()
+        self.play(pinut.BLIP_S + 10)
+        self.extra = {"battery.runtime": str(pinut.MIN_RUNTIME_S - 300)}
+        self.play(5)  # one reading, say a disk spinning up, is not enough
+        self.extra = {"battery.runtime": str(pinut.MIN_RUNTIME_S + 600)}
+        self.play(30)
+        self.assertEqual(self.asked, [])
+        self.extra = {"battery.runtime": str(pinut.MIN_RUNTIME_S - 300)}
+        self.play(pinut.LOW_CONFIRM_S + 5)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_min_runtime_zero_is_off(self):
+        self.extra = {"battery.runtime": "0"}
+        with mock.patch.object(pinut, "MIN_RUNTIME_S", 0):
+            self.outage()
+            self.play(pinut.MAX_ON_BATTERY_S - 5)
+        self.assertEqual(self.asked, [])
+
+    def test_early_server_is_asked_first_and_only_once(self):
+        pinut.SERVERS[1]["early"] = True  # pc
+        self.outage()
+        start = self.t
+        self.play(pinut.EARLY_SHUTDOWN_S - 5)
+        self.assertEqual(self.asked, [])
+        self.play(pinut.MAX_ON_BATTERY_S - pinut.EARLY_SHUTDOWN_S + 10)
+        self.assertEqual(self.asked, [(start + pinut.EARLY_SHUTDOWN_S, "pc"),
+                                      (start + pinut.MAX_ON_BATTERY_S, "nas")])
+
+    def test_early_server_still_on_is_asked_again_by_the_shutdown(self):
+        pinut.SERVERS[1]["early"] = True
+        self.off_after["pc"] = None
+        self.outage()
+        self.play(pinut.MAX_ON_BATTERY_S + 10)
+        self.assertEqual(sorted(n for _, n in self.asked), ["nas", "pc", "pc"])  # pc early, then again
+
+    def test_mains_back_after_an_early_shutdown_stops_there(self):
+        pinut.SERVERS[1]["early"] = True
+        self.outage()
+        self.play(pinut.EARLY_SHUTDOWN_S + 10)
+        self.status = "OL"
+        self.play(1200)
+        self.assertEqual([n for _, n in self.asked], ["pc"])
+        self.assertEqual(self.commands, [])
+
     def test_started_during_an_outage_shuts_down_at_once(self):
         self.status = "OB DISCHRG"
         self.play(5)
@@ -315,14 +371,223 @@ class Outage(unittest.TestCase):
 
     # --- settings ----------------------------------------------------------
 
-    def test_settings_errors(self):
+    def test_settings_problems(self):
         with mock.patch.object(pinut, "SERVERS", []):
-            self.assertTrue(any("empty" in e for e in pinut.settings_errors()))
-        errors = pinut.settings_errors()  # the test servers' keys do not exist
+            self.assertTrue(any("empty" in e for e in pinut.settings_problems()[0]))
+        errors, _ = pinut.settings_problems()  # the test servers' keys do not exist
         self.assertTrue(any("nas: no key" in e for e in errors))
         dup = [{"name": "a", "host": "h", "user": "u", "key": "k"}] * 2
         with mock.patch.object(pinut, "SERVERS", dup):
-            self.assertTrue(any("same name" in e for e in pinut.settings_errors()))
+            self.assertTrue(any("same name" in e for e in pinut.settings_problems()[0]))
+        odd = [{"name": "a", "host": "h", "user": "u", "key": "k", "erly": True, "early": "yes"}]
+        with mock.patch.object(pinut, "SERVERS", odd):
+            errors, warnings = pinut.settings_problems()
+        self.assertTrue(any("early should be true or false" in e for e in errors))
+        self.assertTrue(any("erly is not a server setting" in w for w in warnings))
+
+
+class ShutdownOne(unittest.TestCase):
+    """--shutdown SERVER_NAME must never sound successful when ssh failed."""
+
+    def play(self, returncode, err, key_exists=True):
+        key = Path(tempfile.mkdtemp()) / "k"
+        if key_exists:
+            key.touch()
+        server = {"name": "nas", "host": "10.0.0.1", "user": "root", "key": str(key)}
+        p = mock.Mock(returncode=returncode)
+        p.communicate.return_value = ("", err)
+        out = io.StringIO()
+        with mock.patch.object(pinut, "SERVERS", [server]), \
+                mock.patch.object(pinut, "start_ssh", return_value=p) as start, \
+                contextlib.redirect_stdout(out):
+            code = pinut.shutdown_one("nas")
+        return code, out.getvalue(), start.called
+
+    def test_accepted(self):
+        code, out, _ = self.play(0, "")
+        self.assertEqual(code, 0)
+        self.assertIn("OK:", out)
+
+    def test_never_reached_the_server(self):
+        code, out, _ = self.play(255, "ssh: connect to host 10.0.0.1 port 22: Connection timed out")
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED", out)
+
+    def test_connection_cut_by_the_shutdown_is_unsure(self):
+        code, out, _ = self.play(255, "Connection to 10.0.0.1 closed by remote host.")
+        self.assertEqual(code, 1)
+        self.assertIn("UNSURE", out)
+
+    def test_missing_key_sends_nothing(self):
+        code, out, sent = self.play(0, "", key_exists=False)
+        self.assertEqual(code, 2)
+        self.assertIn("no key", out)
+        self.assertFalse(sent)
+
+
+class Config(unittest.TestCase):
+    """config.toml over the SETTINGS in pinut.py."""
+
+    def setUp(self):
+        saved = {name: getattr(pinut, name) for name in pinut.SETTINGS}
+        self.addCleanup(lambda: [setattr(pinut, n, v) for n, v in saved.items()])
+        self.file = Path(tempfile.mkdtemp()) / "config.toml"
+        patcher = mock.patch.object(pinut, "CONFIG_FILE", self.file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def load(self, text, interactive=False):
+        self.file.write_text(text)
+        return pinut.load_config(interactive)
+
+    def test_values_replace_the_settings_and_the_ups_name_follows(self):
+        errors, warnings = self.load(
+            'UPS_NAME = "apc-lr"\n'
+            "DRY_RUN = false\n"
+            "SAFE_LOAD_PCT = 7.5\n"
+            "MIN_RUNTIME_S = 0   # off\n"
+            'REBOOT_FILE = "~/reboots"\n'
+            "[[SERVERS]]\n"
+            'name = "omv"\n'
+            'host = "192.168.1.40"\n'
+            'user = "shutdownbot"\n'
+            'key = "~/keys/omv"\n'
+            "early = true\n")
+        self.assertEqual((errors, warnings), ([], []))
+        self.assertEqual(pinut.UPS, "apc-lr@localhost")
+        self.assertEqual(pinut.DRIVER_SERVICE, "nut-driver@apc-lr.service")
+        self.assertIs(pinut.DRY_RUN, False)
+        self.assertEqual(pinut.SAFE_LOAD_PCT, 7.5)
+        self.assertEqual(pinut.MIN_RUNTIME_S, 0)
+        self.assertEqual(pinut.REBOOT_FILE, Path.home() / "reboots")
+        self.assertEqual(pinut.SERVERS, [{"name": "omv", "host": "192.168.1.40", "user": "shutdownbot",
+                                          "key": "~/keys/omv", "early": True}])
+
+    def test_the_example_loads_cleanly(self):
+        example = Path(pinut.__file__).with_name("config.example.toml").read_text()
+        self.assertEqual(self.load(example), ([], []))
+        self.assertEqual(pinut.DRIVER_SERVICE, "nut-driver@custom-ups-name.service")
+        self.assertEqual(len(pinut.SERVERS), 2)
+        self.assertTrue(any(s.get("early") for s in pinut.SERVERS))
+
+    def test_ups_and_driver_service_set_directly_win(self):
+        self.assertEqual(self.load('UPS_NAME = "a"\nUPS = "a@10.0.0.5"\nDRIVER_SERVICE = ""\n'), ([], []))
+        self.assertEqual(pinut.UPS, "a@10.0.0.5")
+        self.assertEqual(pinut.DRIVER_SERVICE, "")
+
+    def test_a_name_that_is_not_a_setting_is_reported_and_not_used(self):
+        errors, warnings = self.load("SAFE_LOAD_PC = 8\nsafe_load_pct = 8\n")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("write it SAFE_LOAD_PCT" in w for w in warnings))
+        self.assertEqual(pinut.SAFE_LOAD_PCT, 5)
+        self.assertFalse(hasattr(pinut, "SAFE_LOAD_PC"))
+
+    def test_a_value_of_the_wrong_kind_is_an_error(self):
+        errors, _ = self.load('SAFE_LOAD_PCT = "five"\nDRY_RUN = 1\nBLIP_S = true\nSERVERS = "omv"\n')
+        self.assertEqual(len(errors), 4)
+        self.assertEqual((pinut.SAFE_LOAD_PCT, pinut.DRY_RUN, pinut.BLIP_S), (5, True, 60))
+
+    def test_a_setting_below_the_servers_is_an_error(self):
+        errors, _ = self.load('[[SERVERS]]\nname = "omv"\nDRY_RUN = false\n')
+        self.assertEqual(len(errors), 1)
+        self.assertIn("DRY_RUN is inside the [[SERVERS]] for omv", errors[0])
+        self.assertIs(pinut.DRY_RUN, True)
+
+    def test_broken_toml_is_an_error(self):
+        for text, quotes_hint in (('SERVERS = [\n  {name = "omv"\n', False),
+                                  ("UPS_NAME = apc-lr\n", True), ("DRY_RUN = True\n", True)):
+            errors, _ = self.load(text)
+            self.assertEqual(len(errors), 1)
+            self.assertIn(str(self.file), errors[0])
+            self.assertEqual("quotes" in errors[0], quotes_hint, errors[0])
+
+    def test_no_file_asks_in_a_terminal_and_warns_under_systemd(self):
+        self.assertEqual(len(pinut.load_config(interactive=False)[1]), 1)
+        with mock.patch("builtins.input", return_value="no"):
+            self.assertEqual(len(pinut.load_config(interactive=True)[0]), 1)
+        with mock.patch("builtins.input", return_value="yes"):
+            self.assertEqual(pinut.load_config(interactive=True)[0], [])
+
+
+class Calibrate(unittest.TestCase):
+    """--calibrate: the warning, the CSV, and what the results say."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.ssh = mock.Mock(returncode=0)
+        self.ssh.poll.return_value = 0
+        self.ssh.communicate.return_value = ("", "")
+        self.status = "OL"
+        servers = [{"name": "nas", "host": "10.0.0.1", "user": "root", "key": "~/k1"},
+                   {"name": "pc", "host": "10.0.0.2", "user": "bot", "key": "~/k2"}]
+        for name, value in {
+            "SERVERS": servers,
+            "CALIBRATE_S": 1,
+            "CALIBRATION_DIR": self.dir,
+            "read_ups": lambda: {"ups.status": self.status, "ups.load": "3"},
+            "ping_all": lambda servers: {"nas": True, "pc": False},
+            "start_ssh": mock.Mock(return_value=self.ssh),
+        }.items():
+            patcher = mock.patch.object(pinut, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def play(self, answer):
+        out = io.StringIO()
+        with mock.patch("builtins.input", return_value=answer), contextlib.redirect_stdout(out):
+            code = pinut.calibrate()
+        return code, out.getvalue()
+
+    def test_nothing_is_sent_without_yes(self):
+        code, out = self.play("y")
+        self.assertEqual(code, 1)
+        self.assertIn("for real", out)
+        self.assertFalse(pinut.start_ssh.called)
+
+    def test_only_on_mains(self):
+        self.status = "OB DISCHRG"
+        code, out = self.play("yes")
+        self.assertIn("not on mains", out)
+        self.assertFalse(pinut.start_ssh.called)
+
+    def test_asks_every_server_and_saves_the_load_every_second(self):
+        code, out = self.play("yes")
+        self.assertEqual(pinut.start_ssh.call_count, 2)
+        [csv_file] = self.dir.glob("calibration-*.csv")
+        rows = csv_file.read_text().splitlines()
+        self.assertEqual(rows[0], "time,load")
+        self.assertEqual(len(rows), 1 + pinut.CALIBRATE_S + 1)
+        self.assertTrue(all(r.endswith(",3") for r in rows[1:]))
+        self.assertEqual(code, 1)  # nas still answers, pc never did
+        self.assertIn("STILL ANSWERING", out)
+        self.assertIn("never answered ping", out)
+
+    def results(self, elapsed, last_reply, verdicts=None, loads=(3,) * 10):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            all_off = pinut.print_results(elapsed, last_reply, verdicts or {}, {}, list(loads))
+        return all_off, out.getvalue()
+
+    def test_results_use_the_last_reply(self):
+        all_off, out = self.results(300, {"nas": 102.4, "pc": 15})
+        self.assertTrue(all_off)
+        self.assertIn("nas  stopped answering ping after 1m 42s", out)
+        self.assertIn("Suggested SAFE_LOAD_PCT: 5", out)
+
+    def test_a_reply_near_the_end_is_still_answering(self):
+        all_off, out = self.results(300, {"nas": 295, "pc": 15},
+                                    {"nas": "FAILED (ssh exit 255): the request never reached the server"})
+        self.assertFalse(all_off)
+        self.assertIn("STILL ANSWERING", out)
+        self.assertIn("ssh FAILED", out)
+        self.assertNotIn("Suggested", out)
+
+    def test_load_above_safe_load_pct_is_flagged(self):
+        all_off, out = self.results(300, {"nas": 10, "pc": 10}, loads=[9, 9, 11])
+        self.assertIn("Average load, last 10 s: 9.7%", out)
+        self.assertIn("Suggested SAFE_LOAD_PCT: 13", out)  # the highest, not the average, plus 2
+        self.assertIn("could never prove them off", out)
 
 
 if __name__ == "__main__":
