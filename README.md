@@ -73,7 +73,7 @@ As your normal user:
 
 ```bash
 sudo apt install nut git
-git clone https://github.com/YOUR-USERNAME/pinut.git ~/pinut
+git clone https://github.com/jgbeta/pinut.git ~/pinut
 cd ~/pinut
 python3 -c 'import secrets; print(secrets.token_hex(16))' > upscmd.password
 chmod 600 upscmd.password
